@@ -102,6 +102,119 @@
     });
   }
 
+  // Chain totals are computed on the page from the same rows the board shows, so the panel can
+  // never disagree with the table. A protocol deployed on several chains counts under each of
+  // them, which is why the chain totals overlap and add up to more than the board itself.
+  function chainTotals() {
+    var byChain = {};
+    DATA.rows.forEach(function (r) {
+      (r.chains || []).forEach(function (c) {
+        var t = byChain[c];
+        if (!t) t = byChain[c] = { chain: c, count: 0, watchlist: 0, implied: 0, values: [], bestGrowth: null, top: null };
+        t.count += 1;
+        if (r.watchlist) t.watchlist += 1;
+        t.implied += r.implied_value_usd || 0;
+        t.values.push(r.implied_value_usd || 0);
+        if (r.change_7d !== null && r.change_7d !== undefined && (t.bestGrowth === null || r.change_7d > t.bestGrowth)) t.bestGrowth = r.change_7d;
+        if (!t.top || (r.implied_value_usd || 0) > (t.top.implied_value_usd || 0)) t.top = r;
+      });
+    });
+    return Object.keys(byChain).map(function (k) {
+      var t = byChain[k];
+      var ordered = t.values.slice().sort(function (a, b) { return a - b; });
+      t.median = ordered.length ? ordered[Math.floor(ordered.length / 2)] : 0;
+      delete t.values;
+      return t;
+    }).sort(function (a, b) { return b.implied - a.implied; });
+  }
+
+  function chainPanel() {
+    var totals = chainTotals();
+    var shown = totals.slice(0, 12);
+    var panelTotal = totals.reduce(function (s, t) { return s + t.implied; }, 0);
+    var boardTotal = DATA.rows.reduce(function (s, r) { return s + (r.implied_value_usd || 0); }, 0);
+    var head = el('div', { class: 'chains-head' },
+      el('div', null,
+        el('h2', { text: 'Implied value by chain' }),
+        el('p', { class: 'sub', text: 'Top ' + shown.length + ' of ' + totals.length + ' chains, by the implied value of their pre-token protocols. Select a chain to filter the board to it; select it again to clear.' })
+      ),
+      state.chain !== 'all'
+        ? el('button', { class: 'button', type: 'button', text: 'Clear chain filter', onclick: function () { state.chain = 'all'; writeHash(); render(); } })
+        : null
+    );
+    var grid = el('div', { class: 'chains' });
+    shown.forEach(function (t) {
+      var share = panelTotal ? (t.implied / panelTotal) * 100 : 0;
+      var topImplied = totals[0] ? totals[0].implied : 0;
+      var barWidth = topImplied ? Math.max(2, Math.round((t.implied / topImplied) * 100)) : 0;
+      var wlNote = t.watchlist ? ' · ' + t.watchlist + ' watchlist' : '';
+      var growthNote = t.bestGrowth === null ? '' : ' · best 7d ' + fmtPct(t.bestGrowth);
+      var row = el('button', {
+        type: 'button',
+        class: 'chain-row' + (state.chain === t.chain ? ' active' : ''),
+        'aria-pressed': state.chain === t.chain ? 'true' : 'false',
+        'aria-label': t.chain + ': ' + t.count + ' pre-token protocols, ' + fmtUsd(t.implied) + ' implied value. Filter the board to this chain.',
+        onclick: function () {
+          state.chain = state.chain === t.chain ? 'all' : t.chain;
+          state.tab = 'pre-token';
+          writeHash();
+          render();
+        }
+      },
+        el('span', { class: 'chain-name', text: t.chain }),
+        el('span', { class: 'chain-count', text: t.count + ' protocol' + (t.count === 1 ? '' : 's') + wlNote }),
+        el('span', { class: 'chain-bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + barWidth + '%' })),
+        el('span', { class: 'chain-implied num', text: fmtUsd(t.implied) }),
+        el('span', { class: 'chain-share num', text: share.toFixed(1) + '% of chain totals' }),
+        el('span', { class: 'chain-median sub', text: 'Median ' + fmtUsd(t.median) + growthNote }),
+        el('span', { class: 'chain-top sub', text: 'Top: ' + (t.top ? t.top.name : 'n/a') })
+      );
+      grid.appendChild(row);
+    });
+    var foot = el('p', { class: 'sub', text: 'Chain totals add up to ' + fmtUsd(panelTotal) + ' against ' + fmtUsd(boardTotal) + ' on the board. The gap is the overlap: a protocol deployed on several chains is counted under each of them.' });
+    return el('section', { class: 'panel chains-panel' }, head, grid, foot);
+  }
+
+  function csvCell(value) {
+    var s = value === null || value === undefined ? '' : String(value);
+    if (/[",\n\r]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+    return s;
+  }
+
+  // The export takes exactly the rows the board is showing right now: the same filters, the same
+  // sort, the same tab. On the live-token tab the implied-value column carries the market cap and
+  // there is no farm plan to export, so that column stays empty.
+  function exportCsv() {
+    var preToken = state.tab === 'pre-token';
+    var list = preToken ? sortedRows(rows()) : DATA.live.slice();
+    var header = ['rank', 'name', 'category', 'chains', 'tvl_usd', 'change_7d', 'age_days', 'implied_value_usd', 'token_status', 'farm_steps'];
+    var lines = [header.join(',')];
+    list.forEach(function (r) {
+      var steps = preToken ? DERIVE.farmSteps(r, r.age_days).join(' | ') : '';
+      lines.push([
+        csvCell(preToken ? r.rank : 'live'),
+        csvCell(r.name),
+        csvCell(r.category || 'Other'),
+        csvCell((r.chains || []).join('; ')),
+        csvCell(r.tvl_usd),
+        csvCell(r.change_7d),
+        csvCell(r.age_days),
+        csvCell(preToken ? r.implied_value_usd : r.mcap_usd),
+        csvCell(preToken ? 'no token' : 'already trades'),
+        csvCell(steps)
+      ].join(','));
+    });
+    var blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var link = document.createElement('a');
+    link.href = url;
+    link.download = 'token-radar-' + (preToken ? 'pre-token' : 'live-token') + '-' + DATA.as_of + '.csv';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    window.setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  }
+
   function header() {
     return el('header', { class: 'top' },
       el('div', { class: 'brand' }, el('span', { class: 'mark' }), el('span', { class: 'brand-name', text: 'Token Radar' })),
@@ -156,6 +269,7 @@
       el('div', { class: 'field' }, el('label', { for: 'chain', text: 'Chain' }), chainSelect),
       el('label', { class: 'check', for: 'wl' }, wlBox, 'Watchlist only'),
       el('div', { class: 'field' }, el('span', { class: 'sub', text: 'Token status' }), el('div', { class: 'tabs' }, pre, live)),
+      el('button', { class: 'button export', type: 'button', text: 'Export CSV', onclick: function () { exportCsv(); } }),
       el('span', { class: 'count', text: state.tab === 'pre-token' ? rows().length + ' rows shown' : DATA.live.length + ' live-token protocols' })
     );
   }
@@ -345,7 +459,10 @@
     shell.appendChild(lede());
     shell.appendChild(controls());
     shell.appendChild(state.tab === 'pre-token' ? boardTable() : liveTable());
-    if (state.tab === 'pre-token') shell.appendChild(modelPanel());
+    if (state.tab === 'pre-token') {
+      shell.appendChild(chainPanel());
+      shell.appendChild(modelPanel());
+    }
     app.appendChild(shell);
     app.setAttribute('aria-busy', 'false');
     if (!dialog.isConnected) app.appendChild(dialog);
